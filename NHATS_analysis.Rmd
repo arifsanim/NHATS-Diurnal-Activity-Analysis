@@ -1,0 +1,1591 @@
+---
+title: "NHATS data analysis"
+author: "Md. Ariful Islam Sanim"
+date: "2026-11-21"
+output: pdf_document
+---
+
+# Table 1: participant characteristics by round (NHATS Rounds 11-14)
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(haven)
+library(knitr)
+library(kableExtra)
+library(refund); library(nlme); library(RLRsim); library(broom); library(haven)
+```
+
+
+\textbf{Comment:} Raw NHATS data from Rounds 11–14 were processed to create the final cleaned dataset used in the analysis. Details of the data processing and analytical procedures are provided in Sanim et al.
+
+```{r, exploratory table}
+BASE <- "/Users/arifsanim/Function_data_Research"
+load(file.path(BASE, "Reviwer_comment/merged_clean_r11-14.RData"))   # merged_clean
+stopifnot(nrow(merged_clean) == 2416)
+
+base_dirs <- setNames(file.path(BASE, c("NHATS_R11_Beta_Release_SAS",
+                                        "NHATS_R12_Final_Release_SAS_V2",
+                                        "NHATS_R13_Final_Release_SAS",
+                                        "NHATS_R14_Beta_Release_SAS")), 11:14)
+
+AGE_LEVELS <- c("70-74", "75-79", "80-84", "85-89", "90+")
+
+# ---- Wear metrics (NHATS Accel_Summ_File) ---------------------------------
+
+wear <- map_dfr(11:14, function(r) {
+  list.files(base_dirs[[as.character(r)]], "Accel_Summ_File\\.sas7bdat$",
+             full.names = TRUE)[1] %>%
+    read_sas() %>%
+    transmute(spid, round = r,
+              valid_days = .data[[paste0("ag", r, "dnumdaysval")]],
+              wear_min   = .data[[paste0("ag", r, "dnummin")]],
+              active_min = .data[[paste0("ag", r, "dminact")]])
+}) %>%
+  mutate(across(-c(spid, round), ~ if_else(.x < 0, NA, .x)))
+
+# ---- Analysis data --------------------------------------------------------
+
+base_age <- merged_clean %>%
+  filter(round == 11) %>%
+  distinct(spid, base_age = age_group)
+
+d <- merged_clean %>%
+  transmute(spid, round = as.integer(round), sex, bmi, age_group) %>%
+  left_join(base_age, by = "spid") %>%
+  left_join(wear, by = c("spid", "round")) %>%
+  mutate(sex       = factor(sex, levels = c("Female", "Male")),
+         base_age  = factor(base_age,  levels = AGE_LEVELS),
+         age_group = factor(age_group, levels = AGE_LEVELS))
+
+# ---- Summaries: n (%) and mean (SD) by round ------------------------------
+
+n_pct <- function(var, label) {
+  d %>%
+    count(round, level = {{ var }}, .drop = FALSE) %>%
+    group_by(round) %>%
+    mutate(cell = sprintf("%d (%.1f%%)", n, 100 * n / sum(n))) %>%
+    ungroup() %>%
+    transmute(Variable = paste0(label, level), round, cell)
+}
+
+mean_sd <- function(var, label, digits = 1) {
+  fmt <- sprintf("%%.%1$df (%%.%1$df)", digits)
+  d %>%
+    group_by(round) %>%
+    summarise(cell = sprintf(fmt, mean({{ var }}, na.rm = TRUE),
+                             sd({{ var }}, na.rm = TRUE)), .groups = "drop") %>%
+    mutate(Variable = label)
+}
+
+sections <- list(
+  "Demographics"        = bind_rows(n_pct(sex, "Sex: "),
+                                    mean_sd(bmi, "BMI, kg/m²")),
+  "Baseline age group"  = n_pct(base_age,  "Age group: "),
+  "Age group at round"  = n_pct(age_group, "Age group: "),
+  "Accelerometry wear"  = bind_rows(mean_sd(valid_days, "Valid wear days"),
+                                    mean_sd(wear_min,   "Wear minutes per day", 0),
+                                    mean_sd(active_min, "Active minutes per day"))
+)
+
+table1 <- map(sections, ~ pivot_wider(.x, names_from = round, values_from = cell)) %>%
+  bind_rows()
+
+
+# printing table
+N <- count(d, round)$n
+col_names <- c("", sprintf("Round %d (N = %d)", 11:14, N))
+
+kbl(table1, col.names = col_names, align = "lcccc", booktabs = TRUE,
+    caption = "Descriptive summaries of the variables included in the analysis, by study round (NHATS Rounds 11–14)") %>%
+  kable_styling(full_width = FALSE, latex_options = "hold_position") %>%
+  pack_rows(index = map_int(sections, ~ n_distinct(.x$Variable))) %>%
+  footnote(general = paste(
+    "Cells are n (%) for categorical variables and mean (SD) for continuous variables;",
+    "continuous summaries are computed over non-missing values. Active minutes are",
+    "NHATS-derived (minutes/day above 1853 cpm over 24 h) and are not directly",
+    "comparable with the intensity categories in Supplementary Table 1."),
+    general_title = "", threeparttable = TRUE)
+```
+
+
+
+```{r, message=FALSE, warning=FALSE}
+
+source(file.path(BASE, "Profit_Sim/Profit_V1.R"))
+source(file.path(BASE, "Main_folder/Profit_weighted.R"))
+
+# data cleaning part
+
+func_cols <- str_subset(names(merged_clean), "^dmeanmin")
+
+merged_clean <- merged_clean %>%
+  mutate(round = as.integer(round),
+         across(all_of(func_cols), ~ na_if(.x, -9))) %>%
+  arrange(spid, round)
+
+stopifnot(nrow(merged_clean) == 2416)
+print(count(merged_clean, round))                    # 747 / 639 / 550 / 480
+
+Y <- as.matrix(merged_clean[, func_cols])
+cat("min activity value:", min(Y, na.rm = TRUE), "\n")   # must not be -9
+
+# results from profit (table 2 and table 3)
+
+ids <- unique(merged_clean$spid)
+m   <- as.integer(table(factor(merged_clean$spid, levels = ids)))
+vtl <- split(merged_clean$round, factor(merged_clean$spid, levels = ids))
+tt  <- sort(unique(merged_clean$round))
+
+# Y rows must be blocked by subject in the order m describes
+stopifnot(identical(as.character(merged_clean$spid), as.character(rep(ids, m))))
+
+set.seed(1234)
+profit_result <- profit_data_driven(
+  Y = Y, s = seq_along(func_cols), tt = tt, m = m,
+  visit.time = unlist(vtl, use.names = FALSE),
+  ind.tgrid  = lapply(vtl, function(x) match(x, tt)),
+  pve = 0.9, num_knots = 3)
+
+K   <- profit_result$K
+THR <- 0.05 / K
+cat("K =", K, "  Bonferroni threshold =", signif(THR, 4), "\n")
+
+table_2 <- tibble(PC     = paste0("PC", 1:K),
+                  nlme   = as.numeric(profit_result$pValue[1, ]),
+                  direct = as.numeric(profit_result$pValue[2, ]))
+knitr::kable(
+  table_2,
+  digits = 4,
+  col.names = c("Component", "NLME/RLRsim p-value", "Direct optimization p-value"),
+  caption = "Component-specific PROFIT p-values",
+  booktabs = TRUE
+)
+
+table_3 <- tibble(method  = c("NLME/RLRsim", "Direct optimization"),
+                  max_stat = profit_result$max_TestStat,
+                  min_p    = profit_result$min_pValue,
+                  K = K, threshold = THR,
+                  reject = profit_result$min_pValue < THR)
+knitr::kable(
+  table_3,
+  digits = 4,
+  col.names = c("Method", "Maximum test statistic", "Minimum p-value",
+                "K", "Bonferroni threshold", "Reject"),
+  caption = "Overall PROFIT test results",
+  booktabs = TRUE
+)
+
+```
+
+```{r remaining-setup, message=FALSE, warning=FALSE}
+# Shared definitions
+stopifnot(nrow(Y) == nrow(merged_clean), ncol(Y) == length(func_cols))
+stopifnot(!anyDuplicated(merged_clean[c("spid", "round")]))
+stopifnot(identical(as.character(merged_clean$spid), as.character(rep(ids, m))))
+
+grid_idx <- parse_number(func_cols)
+WAKE    <- c(301, 1380)
+MORNING <- c(301, 660)
+MIDDAY  <- c(661, 1020)
+EVENING <- c(1021, 1380)
+SED_CUT  <- 2860
+MVPA_CUT <- 3941
+in_win <- function(w) grid_idx >= w[1] & grid_idx <= w[2]
+
+covars <- merged_clean %>%
+  select(spid, round, sex, bmi) %>%
+  left_join(merged_clean %>% filter(round == 11) %>%
+              distinct(spid, base_age = age_group), by = "spid") %>%
+  mutate(base_age = factor(as.character(base_age), AGE_LEVELS),
+         sex      = factor(sex, c("Female", "Male")))
+
+fit <- function(d) {
+  d %>%
+    left_join(covars, by = c("spid", "round")) %>%
+    mutate(round = relevel(factor(round), "11")) %>%
+    lme(y ~ round + base_age + sex + bmi, random = ~ 1 | spid,
+        data = ., na.action = na.omit, method = "REML")
+}
+
+tidy_lme <- function(m) {
+  summary(m)$tTable %>% as_tibble(rownames = "term") %>%
+    transmute(term,
+              estimate = round(Value, 3), se = round(Std.Error, 3), df = DF,
+              t = round(`t-value`, 3),
+              p = if_else(`p-value` < 0.001, "<0.001", sprintf("%.3f", `p-value`)))
+}
+
+win_mean <- function(w) {
+  merged_clean %>%
+    transmute(spid, round, y = rowMeans(Y[, in_win(w), drop = FALSE], na.rm = TRUE)) %>%
+    fit()
+}
+```
+
+## Table 4: Overall mean physical activity
+
+```{r table-4, message=FALSE, warning=FALSE}
+m_4 <- win_mean(c(min(grid_idx), max(grid_idx)))  # Full available daily grid
+table_4 <- tidy_lme(m_4)
+
+knitr::kable(
+  table_4, digits = 3, booktabs = TRUE, row.names = FALSE,
+  col.names = c("Term", "Estimate", "SE", "DF", "t-value", "p-value"),
+  caption = "Table 4. Mixed-effects model for overall mean physical activity"
+)
+```
+
+## Table 5: FPC1 and FPC2 score models
+
+```{r table-5, message=FALSE, warning=FALSE}
+stopifnot(ncol(profit_result$phi) >= 4)
+if (anyNA(Y)) {
+  stop("The supplied FPC projection requires complete Y; resolve missing activity values before scoring.")
+}
+phi <- profit_result$phi[, 1:4]
+fpc <- scale(Y %*% phi / length(func_cols))
+fpc[, 1] <- fpc[, 1] * sign(mean(phi[, 1]))
+fpc[, 2] <- fpc[, 2] * sign(mean(phi[in_win(MORNING), 2]) -
+                              mean(phi[in_win(EVENING), 2]))
+colnames(fpc) <- paste0("FPC", 1:4)
+
+stopifnot(cor(fpc[, 1], rowMeans(Y, na.rm = TRUE)) > 0.9)
+
+m_5 <- list(
+  FPC1 = merged_clean %>% transmute(spid, round, y = fpc[, 1]) %>% fit(),
+  FPC2 = merged_clean %>% transmute(spid, round, y = fpc[, 2]) %>% fit())
+
+table_5 <- imap_dfr(m_5, ~ tidy_lme(.x) %>% mutate(outcome = .y, .before = 1))
+table_5_display <- table_5 %>%
+  pivot_wider(names_from = outcome, values_from = c(estimate, se, df, t, p),
+              names_glue = "{outcome}_{.value}") %>%
+  select(term, starts_with("FPC1_"), starts_with("FPC2_"))
+
+knitr::kable(
+  table_5_display,
+  format = "latex",
+  booktabs = TRUE,
+  digits = 3,
+  row.names = FALSE,
+  align = c("l", rep("r", 10)),
+  col.names = c("Term", rep(c("Estimate", "SE", "DF", "t", "p-value"), 2)),
+  caption = "Mixed-effects models for normalized FPC1 and FPC2 scores"
+) %>%
+  kableExtra::add_header_above(c(" " = 1, "FPC1" = 5, "FPC2" = 5)) %>%
+  kableExtra::kable_styling(
+    font_size = 8,
+    latex_options = c("hold_position", "scale_down")
+  )
+```
+
+## Supplementary Table 1: Activity intensity composition by round
+
+```{r supplementary-table-1, message=FALSE, warning=FALSE}
+# Waking-window intensity percentages
+Yw <- Y[, in_win(WAKE), drop = FALSE]
+nw <- rowSums(!is.na(Yw))
+
+tiers <- merged_clean %>%
+  transmute(spid, round,
+            SED  = 100 * rowSums(Yw <  SED_CUT, na.rm = TRUE) / nw,
+            LPA  = 100 * rowSums(Yw >= SED_CUT & Yw < MVPA_CUT, na.rm = TRUE) / nw,
+            MVPA = 100 * rowSums(Yw >= MVPA_CUT, na.rm = TRUE) / nw)
+
+table_S1 <- tiers %>%
+  pivot_longer(c(SED, LPA, MVPA)) %>%
+  group_by(round, name) %>%
+  summarise(N = n(), m = mean(value), s = sd(value), .groups = "drop") %>%
+  mutate(cell = sprintf("%.1f (%.1f) [%.2f]", m, s, s / sqrt(N))) %>%
+  select(round, N, name, cell) %>%
+  pivot_wider(names_from = name, values_from = cell) %>%
+  select(round, N, SED, LPA, MVPA)
+knitr::kable(
+  table_S1, digits = 3, booktabs = TRUE, row.names = FALSE,
+  col.names = c("Round", "N", "SED mean (SD) [SE]", "LPA mean (SD) [SE]", "MVPA mean (SD) [SE]"),
+  caption = "Supplementary Table 1. Distribution of waking-window activity intensity by round"
+)
+```
+
+## Supplementary Table 2: FPC correlations with accelerometry metrics
+
+```{r supplementary-table-2, message=FALSE, warning=FALSE}
+# dminact = minutes/day ABOVE 1853 cpm; dminnon = minutes/day BELOW it
+# (User Guide Appendix A). dminnon is the complement of dminact, NOT non-wear.
+
+PEAK_VAR <- "dmax10"     # try dmax30 / dmax60
+
+summ <- map_dfr(11:14, function(r) {
+  f <- list.files(base_dirs[[as.character(r)]], "Accel_Summ_File\\.sas7bdat$",
+                  full.names = TRUE)[1]
+  read_sas(f) %>%
+    transmute(spid, round = r,
+              tac       = .data[[sprintf("ag%ddtac",        r)]],
+              act_min   = .data[[sprintf("ag%ddminact",     r)]],
+              nonact    = .data[[sprintf("ag%ddminnon",     r)]],
+              peak      = .data[[sprintf("ag%d%s",          r, PEAK_VAR)]],
+              wear_min  = .data[[sprintf("ag%ddnummin",     r)]],
+              valid_day = .data[[sprintf("ag%ddnumdaysval", r)]]) %>%
+    mutate(across(-c(spid, round), ~ na_if(.x, -9)))
+})
+
+q <- quantile(Y, c(0.25, 0.90), na.rm = TRUE)   # pooled reference
+
+metrics <- merged_clean %>%
+  transmute(spid, round,
+            mean_act  = rowMeans(Y, na.rm = TRUE),
+            morning   = rowMeans(Y[, grid_idx >=  361 & grid_idx <=  720], na.rm = TRUE),
+            evening   = rowMeans(Y[, grid_idx >= 1021 & grid_idx <= 1260], na.rm = TRUE),
+            overnight = rowMeans(Y[, grid_idx >=    1 & grid_idx <=  360], na.rm = TRUE),
+            hi_min    = rowSums(Y >  q[2], na.rm = TRUE),
+            lo_min    = rowSums(Y <= q[1], na.rm = TRUE)) %>%
+  left_join(summ, by = c("spid", "round"))
+
+stopifnot(cor(metrics$act_min, metrics$nonact, use = "complete.obs") < -0.95)
+
+labels <- c(mean_act  = "Mean activity",
+            tac       = "Total activity counts (dtac)",
+            act_min   = "Active minutes >1853 cpm (dminact)",
+            peak      = paste0("Peak activity (", PEAK_VAR, ")"),
+            hi_min    = "Minutes > 90th pct of counts",
+            lo_min    = "Minutes <= 25th pct of counts",
+            morning   = "Morning activity (06-12h)",
+            evening   = "Evening activity (17-21h)",
+            overnight = "Overnight activity (00-06h)",
+            wear_min  = "Wear minutes on valid days (dnummin)",
+            valid_day = "Valid wear days (dnumdaysval)")
+
+table_S2 <- metrics %>%
+  select(all_of(names(labels))) %>%
+  imap_dfr(function(x, nm) {
+    correlations <- cor(x, fpc, use = "pairwise.complete.obs")[1, ]
+    bind_cols(tibble(metric = labels[[nm]]),
+              as_tibble_row(setNames(round(correlations, 2), colnames(fpc))))
+  })
+
+knitr::kable(
+  table_S2, digits = 2, booktabs = TRUE, row.names = FALSE,
+  caption = "Supplementary Table 2. FPC correlations with accelerometry metrics"
+)
+```
+
+## Supplementary Table 3: Morning, midday, and evening activity models
+
+```{r supplementary-table-3, message=FALSE, warning=FALSE}
+m_S3 <- list(morning = win_mean(MORNING),
+             midday  = win_mean(MIDDAY),
+             evening = win_mean(EVENING))
+
+table_S3 <- imap_dfr(m_S3, ~ tidy_lme(.x) %>% mutate(window = .y, .before = 1))
+table_S3_display <- table_S3 %>%
+  select(window, term, estimate, se, p) %>%
+  pivot_wider(names_from = window, values_from = c(estimate, se, p),
+              names_glue = "{window}_{.value}") %>%
+  select(term, starts_with("morning_"), starts_with("midday_"), starts_with("evening_"))
+
+knitr::kable(
+  table_S3_display,
+  format = "latex",
+  booktabs = TRUE,
+  digits = 3,
+  row.names = FALSE,
+  align = c("l", rep("r", 9)),
+  col.names = c("Term", rep(c("Estimate", "SE", "p-value"), 3)),
+  caption = "Mixed-effects models for activity by time of day"
+) %>%
+  kableExtra::add_header_above(
+    c(" " = 1, "Morning" = 3, "Midday" = 3, "Evening" = 3)
+  ) %>%
+  kableExtra::kable_styling(
+    font_size = 8,
+    latex_options = c("hold_position", "scale_down")
+  )
+```
+
+## Supplementary Table 4: MVPA and LPA models
+
+```{r supplementary-table-4, message=FALSE, warning=FALSE}
+m_S4 <- list(MVPA = tiers %>% transmute(spid, round, y = MVPA) %>% fit(),
+             LPA  = tiers %>% transmute(spid, round, y = LPA)  %>% fit())
+
+table_S4 <- imap_dfr(m_S4, ~ tidy_lme(.x) %>% mutate(outcome = .y, .before = 1))
+table_S4_display <- table_S4 %>%
+  select(outcome, term, estimate, se, p) %>%
+  pivot_wider(names_from = outcome, values_from = c(estimate, se, p),
+              names_glue = "{outcome}_{.value}") %>%
+  select(term, starts_with("MVPA_"), starts_with("LPA_"))
+
+knitr::kable(
+  table_S4_display, digits = 3, booktabs = TRUE, row.names = FALSE,
+  caption = "Supplementary Table 4. Mixed-effects models for MVPA and LPA percentages"
+)
+```
+
+## Supplementary Table 5: IPCW diagnostics and sensitivity analysis
+
+```{r supplementary-table-5, message=FALSE, warning=FALSE}
+cohort <- merged_clean %>% filter(round == 11) %>% pull(spid) %>% unique()
+
+obs <- expand_grid(spid = cohort, round = 11:14) %>%
+  left_join(merged_clean %>% distinct(spid, round) %>% mutate(R = TRUE),
+            by = c("spid", "round")) %>%
+  mutate(R = coalesce(R, FALSE))
+
+# The original cumulative weights require monotone attrition.
+if (!all(merged_clean$spid %in% cohort)) {
+  stop("IPCW section assumes all participants were observed at Round 11.")
+}
+returned_after_gap <- obs %>%
+  arrange(spid, round) %>%
+  group_by(spid) %>%
+  mutate(returned = R & lag(cumany(!R), default = FALSE)) %>%
+  ungroup()
+if (any(returned_after_gap$returned)) {
+  stop("The supplied IPCW code assumes monotone attrition; returning participants require a revised observation model.")
+}
+
+dem_cov <- intersect(c("age", "sex", "bmi"), names(merged_clean))
+fp      <- fpca.face(Y, pve = 0.9)
+fpc_cov <- paste0("fpc", 1:3)
+
+cov_all <- merged_clean %>%
+  select(spid, round, all_of(dem_cov)) %>%
+  bind_cols(as_tibble(fp$scores[, 1:3], .name_repair = ~ fpc_cov)) %>%
+  mutate(activity = rowMeans(Y, na.rm = TRUE))
+
+use_cov  <- c(dem_cov, fpc_cov)
+cov_prev <- paste0(use_cov, "_prev")
+
+fill_one <- function(x) {
+  if (is.numeric(x)) x[is.na(x)] <- median(x, na.rm = TRUE)
+  else x[is.na(x)] <- names(sort(table(x), decreasing = TRUE))[1]
+  x
+}
+
+lagged <- obs %>%
+  left_join(cov_all, by = c("spid", "round")) %>%
+  group_by(spid) %>% arrange(round, .by_group = TRUE) %>%
+  mutate(R_prev = lag(R),
+         across(all_of(c(use_cov, "activity")), lag, .names = "{.col}_prev")) %>%
+  ungroup() %>%
+  filter(round >= 12, R_prev) %>%
+  mutate(across(all_of(cov_prev), ~ as.integer(is.na(.x)), .names = "{.col}_miss"),
+         across(all_of(cov_prev), fill_one),
+         activity_prev_z = as.numeric(scale(activity_prev)))
+
+miss_terms <- keep(paste0(cov_prev, "_miss"), ~ n_distinct(lagged[[.x]]) > 1)
+
+or_activity <- glm(reformulate(c(paste0(dem_cov, "_prev"), "activity_prev_z",
+                                 "factor(round)"), response = "R"),
+                   data = lagged, family = binomial) %>%
+  tidy(conf.int = TRUE, exponentiate = TRUE) %>% filter(term == "activity_prev_z")
+
+pred_p <- map_dfr(12:14, function(j) {
+  dd <- filter(lagged, round == j)
+  mm <- glm(reformulate(c(cov_prev, miss_terms), response = "R"),
+            data = dd, family = binomial)
+  tibble(spid = dd$spid, round = j, R = dd$R,
+         p_hat = as.numeric(predict(mm, type = "response")), p_marg = mean(dd$R))
+})
+
+wt <- pred_p %>%
+  arrange(spid, round) %>% group_by(spid) %>%
+  mutate(w_stab = cumprod(p_marg) / cumprod(p_hat)) %>% ungroup() %>%
+  filter(R) %>% select(spid, round, p_hat, w_stab) %>%
+  bind_rows(tibble(spid = cohort, round = 11L, p_hat = 1, w_stab = 1)) %>%
+  group_by(round) %>% mutate(w = pmin(w_stab, quantile(w_stab, 0.99))) %>%
+  ungroup() %>% arrange(spid, round)
+
+stopifnot(nrow(wt) == nrow(merged_clean))
+
+table_S5a <- wt %>% group_by(round) %>%
+  summarise(n = n(),
+            min_p_hat    = round(min(p_hat), 3),
+            mean_w       = round(mean(w_stab), 3),
+            max_w_untrim = round(max(w_stab), 2),
+            n_trimmed    = sum(w_stab > w + 1e-12),
+            ESS_trim     = round(sum(w)^2 / sum(w^2)),
+            ESS_pct      = round(100 * (sum(w)^2 / sum(w^2)) / n(), 1),
+            .groups = "drop")
+
+
+dw <- merged_clean %>% left_join(select(wt, spid, round, w),
+                                 by = c("spid", "round")) %>% arrange(spid, round)
+stopifnot(!anyNA(dw$w), identical(as.character(dw$spid), as.character(rep(ids, m))))
+
+profit_args <- list(Y = Y, s = seq_along(func_cols), tt = tt, m = m,
+             visit.time = unlist(vtl, use.names = FALSE),
+             ind.tgrid  = lapply(vtl, function(x) match(x, tt)),
+             pve = 0.9, num_knots = 3)
+
+set.seed(1234)
+fit_unw  <- do.call(profit_data_driven_wtd, c(profit_args, list(wts = NULL)))
+set.seed(1234)
+fit_ipcw <- do.call(profit_data_driven_wtd, c(profit_args, list(wts = dw$w)))
+
+sig_pcs <- function(f, row) {
+  p <- as.numeric(f$pValue[row, ])
+  paste0("PC", which(p < 0.05 / f$K), collapse = ", ")
+}
+
+table_S5b <- tibble(
+  analysis   = c("Unweighted (primary)", "IPCW-weighted (sensitivity)"),
+  K          = c(fit_unw$K, fit_ipcw$K),
+  threshold  = round(0.05 / c(fit_unw$K, fit_ipcw$K), 5),
+  sig_nlme   = c(sig_pcs(fit_unw, 1), sig_pcs(fit_ipcw, 1)),
+  sig_direct = c(sig_pcs(fit_unw, 2), sig_pcs(fit_ipcw, 2)),
+  conclusion = map_chr(list(fit_unw, fit_ipcw), function(f) {
+    if (all(apply(f$pValue, 1, min) < 0.05 / f$K)) "Reject (both methods)"
+    else if (all(apply(f$pValue, 1, min) >= 0.05 / f$K)) "Do not reject (both methods)"
+    else "Methods differ"
+  }))
+
+
+# fit_unw is the same specification as profit_result -- K must agree
+stopifnot(fit_unw$K == profit_result$K)
+
+knitr::kable(
+  table_S5a, digits = 3, booktabs = TRUE, row.names = FALSE,
+  caption = "Supplementary Table 5a. IPCW diagnostics"
+)
+
+knitr::kable(
+  table_S5b, digits = 3, booktabs = TRUE, row.names = FALSE,
+  caption = "Supplementary Table 5b. PROFIT results with and without IPCW"
+)
+
+# Retention association reported in the Supplementary Table 5 note
+knitr::kable(
+  or_activity %>% select(term, estimate, conf.low, conf.high, p.value), digits = 3, booktabs = TRUE, row.names = FALSE,
+  col.names = c("Term", "Odds ratio", "95% CI lower", "95% CI upper", "p-value"),
+  caption = "Supplementary Table 5 note. Prior activity and subsequent retention"
+)
+```
+
+## Supplementary Table 6: Component-wise PROFIT before and after IPCW
+
+```{r supplementary-table-6, message=FALSE, warning=FALSE}
+fmt_p <- function(p) if_else(is.na(p), NA_character_,
+                             if_else(p < 0.001, "<0.001", format(signif(p, 3))))
+pad   <- function(x, n) c(x, rep(NA_real_, n - length(x)))
+Kmax  <- max(fit_unw$K, fit_ipcw$K)
+
+table_S6 <- tibble(PC          = paste0("PC", 1:Kmax),
+                   unw_nlme    = pad(as.numeric(fit_unw$pValue[1, ]),  Kmax),
+                   unw_direct  = pad(as.numeric(fit_unw$pValue[2, ]),  Kmax),
+                   ipcw_nlme   = pad(as.numeric(fit_ipcw$pValue[1, ]), Kmax),
+                   ipcw_direct = pad(as.numeric(fit_ipcw$pValue[2, ]), Kmax)) %>%
+  mutate(across(-PC, fmt_p))
+knitr::kable(
+  table_S6, digits = 3, booktabs = TRUE, row.names = FALSE,
+  col.names = c("Component", "Unweighted NLME", "Unweighted direct", "IPCW NLME", "IPCW direct"),
+  caption = "Supplementary Table 6. Component-wise PROFIT results before and after IPCW"
+)
+```
+
+## Supplementary Table 7: Complete-case PROFIT sensitivity analysis
+
+```{r supplementary-table-7, message=FALSE, warning=FALSE}
+run_profit <- function(data, num_knots = 3, label = "") {
+  data <- arrange(data, spid, round)
+  ids  <- unique(data$spid)
+  m    <- as.integer(table(factor(data$spid, levels = ids)))
+  vtl  <- split(data$round, factor(data$spid, levels = ids))
+  tt   <- sort(unique(data$round))
+  
+  # Y rows must be blocked by subject in the order m describes
+  stopifnot(identical(as.character(data$spid), as.character(rep(ids, m))))
+  
+  set.seed(1234)
+  fit <- profit_data_driven(
+    Y          = as.matrix(data[, func_cols]),
+    s          = seq_along(func_cols),
+    tt         = tt,
+    m          = m,
+    visit.time = unlist(vtl, use.names = FALSE),
+    ind.tgrid  = lapply(vtl, function(x) match(x, tt)),
+    pve        = 0.9,
+    num_knots  = num_knots)
+  
+  fit
+}
+
+complete_ids <- merged_clean %>%
+  count(spid) %>% filter(n == 4) %>% pull(spid)
+fit_complete <- run_profit(filter(merged_clean, spid %in% complete_ids), 3,
+                           "Complete case")
+
+# Asterisks identify significance using each fit's own threshold.
+format_pc_p <- function(f, row) {
+  p <- as.numeric(f$pValue[row, ])
+  paste0(ifelse(p < 0.001, "<0.001", sprintf("%.4f", p)),
+         ifelse(p < 0.05 / f$K, "*", ""))
+}
+
+table_S7 <- tibble(
+  PC = paste0("PC", seq_len(fit_complete$K)),
+  nlme = format_pc_p(fit_complete, 1),
+  direct = format_pc_p(fit_complete, 2)
+)
+
+knitr::kable(
+  table_S7, digits = 3, booktabs = TRUE, row.names = FALSE,
+  col.names = c("Component", "NLME/RLRsim", "Direct optimization"),
+  caption = "Supplementary Table 7. Complete-case PROFIT results"
+)
+
+# Actual threshold for the table note
+threshold_S7 <- 0.05 / fit_complete$K
+```
+
+## Supplementary Table 8: PROFIT across comparison windows
+
+```{r supplementary-table-8, message=FALSE, warning=FALSE}
+fit_r1214 <- run_profit(filter(merged_clean, round %in% 12:14), 3,
+                        "Rounds 12-14")
+fit_r1314 <- run_profit(filter(merged_clean, round %in% 13:14), 2,
+                        "Rounds 13-14")
+
+K_S8 <- max(fit_r1214$K, fit_r1314$K)
+pad_S8 <- function(x) c(x, rep(NA_character_, K_S8 - length(x)))
+
+table_S8 <- tibble(
+  PC = paste0("PC", seq_len(K_S8)),
+  `12-14 NLME`   = pad_S8(format_pc_p(fit_r1214, 1)),
+  `12-14 direct` = pad_S8(format_pc_p(fit_r1214, 2)),
+  `13-14 NLME`   = pad_S8(format_pc_p(fit_r1314, 1)),
+  `13-14 direct` = pad_S8(format_pc_p(fit_r1314, 2))
+)
+
+knitr::kable(
+  table_S8, digits = 3, booktabs = TRUE, row.names = FALSE,
+  caption = "Supplementary Table 8. Component-wise PROFIT results across comparison windows"
+)
+
+# Use the actual K and threshold for each comparison in the table note.
+thresholds_S8 <- tibble(
+  comparison = c("Rounds 12-14", "Rounds 13-14"),
+  K = c(fit_r1214$K, fit_r1314$K),
+  threshold = 0.05 / K
+)
+```
+
+## Supplementary Table 9: Interview month and season by round
+
+```{r supplementary-table-9, message=FALSE, warning=FALSE}
+get_month <- function(r, pat, var) {
+  f <- list.files(base_dirs[[as.character(r)]],
+                  paste0(pat, ".*\\.sas7bdat$"), full.names = TRUE)[1]
+  if (is.na(f)) return(NULL)
+  x <- read_sas(f); v <- sprintf(var, r)
+  if (!v %in% names(x)) return(NULL)
+  tibble(spid = x$spid, round = r, month = as.integer(x[[v]]))
+}
+
+months <- map_dfr(11:14, ~ bind_rows(get_month(.x, "SP_File",      "ab%sdatemonth"),
+                                     get_month(.x, "Tracker_File", "r%sspstatdtm"))) %>%
+  filter(month %in% 1:12) %>%
+  distinct(spid, round, .keep_all = TRUE)
+
+d_season <- merged_clean %>%
+  transmute(spid, round, mean_pa = rowMeans(Y, na.rm = TRUE)) %>%
+  left_join(months, by = c("spid", "round")) %>%
+  mutate(season = case_when(month %in% 3:5 ~ "Spring", month %in% 6:8 ~ "Summer",
+                            month %in% 9:11 ~ "Fall",  month %in% c(12,1,2) ~ "Winter"),
+         season = factor(season, c("Spring", "Summer", "Fall", "Winter")),
+         month  = factor(month.name[month], month.name))
+
+stopifnot(nrow(d_season) == nrow(merged_clean))
+n_missing_month <- sum(is.na(d_season$month))
+
+pct_by_round <- function(v) {
+  d_season %>% filter(!is.na(.data[[v]])) %>%
+    count(round, level = .data[[v]], .drop = FALSE) %>%
+    group_by(round) %>% mutate(p = round(100 * n / sum(n), 1)) %>% ungroup() %>%
+    select(-n) %>% pivot_wider(names_from = round, values_from = p, names_prefix = "R")
+}
+
+table_S9 <- bind_rows(pct_by_round("season"), pct_by_round("month"))
+knitr::kable(
+  table_S9, digits = 1, booktabs = TRUE, row.names = FALSE,
+  caption = "Supplementary Table 9. Interview season and month percentages by round"
+)
+```
+
+## Supplementary Table 10: Round effects with and without season adjustment
+
+```{r supplementary-table-10, message=FALSE, warning=FALSE}
+d5 <- d_season %>% select(spid, round, y = mean_pa, season)
+m_S10_0 <- fit(select(d5, spid, round, y))
+m_S10_1 <- lme(y ~ round + base_age + sex + bmi + season,
+                 random = ~ 1 | spid, method = "REML", na.action = na.omit,
+                 data = left_join(d5, covars, by = c("spid", "round")) %>%
+                   mutate(round = relevel(factor(round), "11")))
+
+round_rows <- function(m, lab) {
+  tidy_lme(m) %>% filter(str_starts(term, "round")) %>%
+    transmute(term, !!lab := sprintf("%s (%s)", estimate, p))
+}
+table_S10 <- full_join(round_rows(m_S10_0, "no_season"),
+                      round_rows(m_S10_1, "season_adj"), by = "term")
+knitr::kable(
+  table_S10, digits = 3, booktabs = TRUE, row.names = FALSE,
+  col.names = c("Term", "Without season: estimate (p)", "With season: estimate (p)"),
+  caption = "Supplementary Table 10. Round effects with and without season adjustment"
+)
+
+# Check whether missing interview months changed the model sample.
+season_model_n <- c(without_season = nobs(m_S10_0), with_season = nobs(m_S10_1))
+```
+
+The outputs above use the table numbers from the supplied PDFs. Table captions may be automatically numbered by your document format; their descriptive text identifies the intended manuscript or supplementary table.
+
+
+# Plots 
+
+```{r figure-setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(scales)
+library(viridis)
+library(gridExtra)
+library(grid)
+library(patchwork)
+library(RColorBrewer)
+
+stopifnot(exists("merged_clean"), exists("func_cols"), exists("profit_result"))
+
+# Plotting data
+figure_dat <- merged_clean %>%
+  mutate(round = as.integer(round),
+         across(all_of(func_cols), ~ na_if(.x, -9))) %>%
+  arrange(spid, round)
+
+profit_columns <- func_cols
+
+stopifnot(nrow(figure_dat) == 2416,
+          !anyDuplicated(figure_dat[c("spid", "round")]),
+          nrow(profit_result$phi) == length(profit_columns))
+
+figure_r14_ids <- figure_dat %>%
+  filter(round == 14) %>%
+  pull(spid) %>%
+  unique()
+
+figure_complete_ids <- figure_dat %>%
+  group_by(spid) %>%
+  summarise(complete = all(11:14 %in% round), .groups = "drop") %>%
+  filter(complete) %>%
+  pull(spid)
+
+stopifnot(setequal(figure_r14_ids, figure_complete_ids))
+```
+
+## Figure 1: Mean activity curves across rounds
+
+```{r figure-1, message=FALSE, warning=FALSE, fig.width=10, fig.height=5.5}
+figure_1 <- local({
+  merged_clean <- figure_dat
+
+  # Round labels
+  round_labels <- c(
+    `11` = "Round 11 (2021)",
+    `12` = "Round 12 (2022)",
+    `13` = "Round 13 (2023)",
+    `14` = "Round 14 (2024)"
+  )
+
+  # Common theme function
+  pub_theme <- function() {
+    theme_bw() +
+      theme(
+        text = element_text(size = 12, family = "serif"),
+        axis.title = element_text(size = 11),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+        panel.grid.major = element_line(color = "gray90"),
+        panel.grid.minor = element_blank(),
+        legend.position = "none"
+      )
+  }
+
+  # PLOT 1: All Available Data
+  long_data_all <- merged_clean %>%
+    pivot_longer(cols = starts_with("dmeanmin"), 
+                 names_to = "variable", 
+                 values_to = "value") %>%
+    mutate(index = parse_number(variable))
+
+  combined_all <- long_data_all %>%
+    group_by(round, index) %>%
+    summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop")
+
+  plot1 <- ggplot(combined_all, aes(x = index, y = mean_value, color = factor(round))) +
+    geom_smooth(se = FALSE, method = "loess", span = 0.2, linewidth = 1) +
+    scale_color_viridis_d(option = "D", name = "Study Round", labels = round_labels) +
+    labs(x = "Time of Day (Minutes)", 
+         y = "Mean Daily Activity",
+         title = "All Available Data") +
+    scale_x_continuous(breaks = pretty_breaks(n = 8)) +
+    scale_y_continuous(labels = function(x) round(x, 1)) +
+    pub_theme()
+
+  # PLOT 2: Complete-case (Round 14 subjects)
+  spids_r14 <- merged_clean %>%
+    filter(round == 14) %>%
+    pull(spid) %>%
+    unique()
+
+  long_data_r14 <- merged_clean %>%
+    filter(spid %in% spids_r14) %>%
+    pivot_longer(cols = starts_with("dmeanmin"), 
+                 names_to = "variable", 
+                 values_to = "value") %>%
+    mutate(index = parse_number(variable))
+
+  combined_r14 <- long_data_r14 %>%
+    group_by(round, index) %>%
+    summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop")
+
+  plot2 <- ggplot(combined_r14, aes(x = index, y = mean_value, color = factor(round))) +
+    geom_smooth(se = FALSE, method = "loess", span = 0.2, linewidth = 1) +
+    scale_color_viridis_d(option = "D", name = "Study Round", labels = round_labels) +
+    labs(x = "Time of Day (Minutes)", 
+         y = "Mean Daily Activity",
+         title = "Complete-case (Round 14 subjects)") +
+    scale_x_continuous(breaks = pretty_breaks(n = 8)) +
+    scale_y_continuous(labels = function(x) round(x, 1)) +
+    pub_theme()
+
+  # Extract legend from plot1
+  get_legend <- function(plot) {
+    tmp <- ggplot_gtable(ggplot_build(plot + theme(legend.position = "bottom")))
+    leg <- which(vapply(tmp$grobs, function(x) {
+      grepl("^guide-box", x$name) && !inherits(x, "zeroGrob")
+    }, logical(1)))
+    if (!length(leg)) stop("No legend was found for Figure 1.")
+    tmp$grobs[[leg[1]]]
+  }
+
+  legend <- get_legend(plot1)
+
+  combined <- arrangeGrob(
+    arrangeGrob(plot1, plot2, ncol = 2),
+    legend,
+    ncol = 1,
+    heights = c(10, 1),
+    top = textGrob("Comparison: All Data vs Complete-case (Round 14 subjects)",
+                   gp = gpar(fontsize = 14, fontface = "bold", fontfamily = "serif"))
+  )
+
+  combined
+})
+
+grid::grid.newpage()
+grid::grid.draw(figure_1)
+
+```
+
+## Figure 2: Activity profiles by sex
+
+```{r figure-2, message=FALSE, warning=FALSE, fig.width=7.3, fig.height=9}
+figure_2 <- local({
+  merged_clean <- figure_dat
+
+  MISSING    <- -9
+  SMOOTH_WIN <- 31        # centred rolling mean, in grid points
+  CONF       <- 1.96
+
+  SEX_LEVELS <- c("Female", "Male")
+  SEX_COL <- c("Female" = "#1F4E79", "Male" = "#D98324")
+  SEX_LTY <- c("Female" = "solid",   "Male" = "42")
+
+  # grid
+
+  func_cols   <- grep("^dmeanmin", names(merged_clean), value = TRUE)
+  minute_cols <- func_cols[order(as.numeric(gsub("\\D", "", func_cols)))]
+  n_grid <- length(minute_cols)
+  mpp    <- 1440 / n_grid
+
+  roll <- function(x, k = SMOOTH_WIN) {
+    if (k <= 1) return(x)
+    as.numeric(stats::filter(x, rep(1 / k, k), sides = 2, circular = TRUE))
+  }
+
+  analysis_dat <- merged_clean %>%
+    mutate(sex = factor(as.character(sex), levels = SEX_LEVELS))
+
+  if (anyNA(analysis_dat$sex)) {
+    stop("sex labels do not match SEX_LEVELS; observed: ",
+         paste(unique(as.character(merged_clean$sex)), collapse = ", "))
+  }
+
+  # Curves
+
+  compute_curves <- function(data) {
+    
+    long <- data %>%
+      select(spid, round, grp = sex, all_of(minute_cols)) %>%
+      pivot_longer(all_of(minute_cols), names_to = "variable", values_to = "value") %>%
+      mutate(value = na_if(value, MISSING),
+             hour  = (match(variable, minute_cols) - 0.5) * mpp / 60)
+    
+    curves <- long %>%
+      group_by(round, grp, hour) %>%
+      summarise(mean = mean(value, na.rm = TRUE),
+                se   = sd(value, na.rm = TRUE) / sqrt(sum(!is.na(value))),
+                .groups = "drop") %>%
+      arrange(round, grp, hour) %>%
+      group_by(round, grp) %>%
+      mutate(mean  = roll(mean),
+             se    = roll(se),
+             lower = pmax(mean - CONF * se, 0),
+             upper = mean + CONF * se) %>%
+      ungroup()
+    
+    n_tab <- long %>%
+      distinct(spid, round, grp) %>%
+      count(round, grp, name = "n_sub")
+    
+    list(curves = curves, n_tab = n_tab)
+  }
+
+  res_all <- compute_curves(analysis_dat)
+
+  spids_r14 <- analysis_dat %>% filter(round == 14) %>% pull(spid) %>% unique()
+  res_cc    <- compute_curves(filter(analysis_dat, spid %in% spids_r14))
+
+  Y_MAX <- ceiling(max(c(res_all$curves$upper, res_cc$curves$upper),
+                       na.rm = TRUE) / 500) * 500
+
+  # Plot builder
+
+  make_sex_plot <- function(res, y_max = Y_MAX,
+                            legend_title = "Sex",
+                            lab_x    = 0.4,     # inset from left, in hours
+                            lab_gap  = 3.4,     # gap to the "(n = ...)" column
+                            lab_top  = 0.972,   # first line, fraction of y_max
+                            lab_step = 0.11,    # line spacing, fraction of y_max
+                            lab_size = 2.9) {   # mm; ~8.2 pt
+    
+    curves <- res$curves
+    n_tab  <- res$n_tab
+    
+    n_lab <- n_tab %>%
+      arrange(round, grp) %>%
+      group_by(round) %>%
+      mutate(y     = y_max * (lab_top - (row_number() - 1) * lab_step),
+             lab   = as.character(grp),
+             n_txt = sprintf("(n = %d)", n_sub)) %>%
+      ungroup()
+    
+    lg_main  <- guide_legend(title.position = "left", title.vjust = 0.5,
+                             nrow = 1, order = 1,
+                             override.aes = list(alpha = 1, linewidth = 1.1))
+    lg_plain <- guide_legend(title.position = "left", title.vjust = 0.5,
+                             nrow = 1, order = 1)
+    
+    ggplot(curves, aes(hour, mean, colour = grp, fill = grp, linetype = grp)) +
+      geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, colour = NA) +
+      geom_line(linewidth = 0.62, lineend = "round") +
+      # sex label
+      geom_text(data = n_lab, aes(x = lab_x, y = y, label = lab, colour = grp),
+                inherit.aes = FALSE, hjust = 0, vjust = 1,
+                size = lab_size, fontface = "bold", show.legend = FALSE) +
+      # sample size, bracketed
+      geom_text(data = n_lab, aes(x = lab_x + lab_gap, y = y, label = n_txt,
+                                  colour = grp),
+                inherit.aes = FALSE, hjust = 0, vjust = 1,
+                size = lab_size, fontface = "bold", show.legend = FALSE) +
+      facet_wrap(~ round, ncol = 2,
+                 labeller = labeller(round = function(z) paste("Round", z))) +
+      scale_x_continuous(breaks = seq(0, 24, 2), limits = c(0, 24),
+                         expand = c(0.012, 0)) +
+      scale_y_continuous(breaks = seq(0, y_max, 500), limits = c(0, y_max),
+                         expand = c(0.008, 0)) +
+      scale_colour_manual(values   = SEX_COL, name = legend_title, drop = FALSE) +
+      scale_fill_manual(values     = SEX_COL, name = legend_title, drop = FALSE) +
+      scale_linetype_manual(values = SEX_LTY, name = legend_title, drop = FALSE) +
+      labs(x = "Time of Day (hours)", y = "Mean daily activity") +
+      theme_bw(base_size = 9) +
+      theme(
+        panel.grid.major  = element_line(colour = "grey93", linewidth = 0.22),
+        panel.grid.minor  = element_blank(),
+        panel.border      = element_rect(colour = "grey45", linewidth = 0.35),
+        panel.spacing.x   = unit(9, "pt"),
+        panel.spacing.y   = unit(7, "pt"),
+        strip.background  = element_rect(fill = "grey93", colour = "grey45",
+                                         linewidth = 0.35),
+        strip.text        = element_text(size = 8.8, face = "bold", colour = "grey15",
+                                         margin = margin(t = 3.2, b = 3.2)),
+        axis.title.x      = element_text(size = 9.2, margin = margin(t = 6)),
+        axis.title.y      = element_text(size = 9.2, margin = margin(r = 6)),
+        axis.text.x       = element_text(size = 7.2, colour = "grey25"),
+        axis.text.y       = element_text(size = 7.8, colour = "grey25"),
+        axis.ticks        = element_line(colour = "grey45", linewidth = 0.3),
+        legend.position   = "bottom",
+        legend.title      = element_text(size = 9, margin = margin(r = 8)),
+        legend.text       = element_text(size = 8.4, margin = margin(r = 10, l = 3)),
+        legend.key        = element_blank(),
+        legend.key.width  = unit(20, "pt"),
+        legend.key.height = unit(9, "pt"),
+        legend.margin     = margin(t = 0, b = 0),
+        legend.box.margin = margin(t = -2),
+        plot.margin       = margin(5, 7, 3, 5)
+      ) +
+      guides(colour = lg_main, fill = lg_plain, linetype = lg_plain)
+  }
+
+  # Build and export -- TIFF only
+
+  sex_plot_all <- make_sex_plot(res_all)
+  sex_plot_cc  <- make_sex_plot(res_cc)
+
+  combined_sex <- (sex_plot_all / sex_plot_cc) +
+    plot_layout(guides = "collect") +
+    plot_annotation(tag_levels = "A") &
+    theme(legend.position = "bottom",
+          plot.tag = element_text(face = "bold", size = 16))
+
+  combined_sex
+})
+
+figure_2
+
+```
+
+## Figure 3: Activity profiles by baseline age group
+
+```{r figure-3, message=FALSE, warning=FALSE, fig.width=7.3, fig.height=9}
+figure_3 <- local({
+  merged_clean <- figure_dat
+
+  MISSING      <- -9
+  SMOOTH_WIN   <- 31        # centred rolling mean, in grid points
+  CONF         <- 1.96
+  AGE_COL_NAME <- "age_group"
+
+  AGE_LEVELS <- c("70-74", "75-79", "80-84", "85-89", "90+")
+  AGE_COL <- c("70-74" = "#1F4E79", "75-79" = "#2E8B94", "80-84" = "#6BA55C",
+               "85-89" = "#D98324", "90+"   = "#B33A3A")
+  AGE_LTY <- c("70-74" = "solid", "75-79" = "42", "80-84" = "62",
+               "85-89" = "4212",  "90+"   = "12")
+
+  # grid
+
+  func_cols   <- grep("^dmeanmin", names(merged_clean), value = TRUE)
+  minute_cols <- func_cols[order(as.numeric(gsub("\\D", "", func_cols)))]
+  n_grid <- length(minute_cols)
+  mpp    <- 1440 / n_grid
+
+  roll <- function(x, k = SMOOTH_WIN) {
+    if (k <= 1) return(x)
+    as.numeric(stats::filter(x, rep(1 / k, k), sides = 2, circular = TRUE))
+  }
+
+  # baseline age group, constant within person
+
+  stopifnot(AGE_COL_NAME %in% names(merged_clean))
+
+  base_age_map <- merged_clean %>%
+    filter(round == 11L) %>%
+    distinct(spid, base_age = .data[[AGE_COL_NAME]])
+
+  analysis_dat <- merged_clean %>%
+    left_join(base_age_map, by = "spid") %>%
+    mutate(base_age = factor(as.character(base_age), levels = AGE_LEVELS))
+
+  if (anyNA(analysis_dat$base_age)) {
+    stop("age labels do not match AGE_LEVELS; observed: ",
+         paste(unique(as.character(merged_clean[[AGE_COL_NAME]])), collapse = ", "))
+  }
+
+  # Curves
+
+  compute_curves <- function(data) {
+    
+    long <- data %>%
+      select(spid, round, grp = base_age, all_of(minute_cols)) %>%
+      pivot_longer(all_of(minute_cols), names_to = "variable", values_to = "value") %>%
+      mutate(value = na_if(value, MISSING),
+             hour  = (match(variable, minute_cols) - 0.5) * mpp / 60)
+    
+    curves <- long %>%
+      group_by(round, grp, hour) %>%
+      summarise(mean = mean(value, na.rm = TRUE),
+                se   = sd(value, na.rm = TRUE) / sqrt(sum(!is.na(value))),
+                .groups = "drop") %>%
+      arrange(round, grp, hour) %>%
+      group_by(round, grp) %>%
+      mutate(mean  = roll(mean),
+             se    = roll(se),
+             lower = pmax(mean - CONF * se, 0),
+             upper = mean + CONF * se) %>%
+      ungroup()
+    
+    n_tab <- long %>%
+      distinct(spid, round, grp) %>%
+      count(round, grp, name = "n_sub")
+    
+    list(curves = curves, n_tab = n_tab)
+  }
+
+  res_all <- compute_curves(analysis_dat)
+
+  spids_r14 <- analysis_dat %>% filter(round == 14) %>% pull(spid) %>% unique()
+  res_cc    <- compute_curves(filter(analysis_dat, spid %in% spids_r14))
+
+  Y_MAX <- ceiling(max(c(res_all$curves$upper, res_cc$curves$upper),
+                       na.rm = TRUE) / 500) * 500
+
+  # Plot builder
+
+  make_age_plot <- function(res, y_max = Y_MAX,
+                            legend_title = "Age group at baseline",
+                            lab_x    = 0.4,     # inset from left, in hours
+                            lab_gap  = 2.8,     # gap to the "(n = ...)" column
+                            lab_top  = 0.972,   # first line, fraction of y_max
+                            lab_step = 0.11,    # line spacing, fraction of y_max
+                            lab_size = 2.9) {   # mm; ~8.2 pt
+    
+    curves <- res$curves
+    n_tab  <- res$n_tab
+    
+    n_lab <- n_tab %>%
+      arrange(round, grp) %>%
+      group_by(round) %>%
+      mutate(y     = y_max * (lab_top - (row_number() - 1) * lab_step),
+             lab   = as.character(grp),
+             n_txt = sprintf("(n = %d)", n_sub)) %>%
+      ungroup()
+    
+    lg_main  <- guide_legend(title.position = "left", title.vjust = 0.5,
+                             nrow = 1, order = 1,
+                             override.aes = list(alpha = 1, linewidth = 1.1))
+    lg_plain <- guide_legend(title.position = "left", title.vjust = 0.5,
+                             nrow = 1, order = 1)
+    
+    ggplot(curves, aes(hour, mean, colour = grp, fill = grp, linetype = grp)) +
+      geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.15, colour = NA) +
+      geom_line(linewidth = 0.62, lineend = "round") +
+      # age group label
+      geom_text(data = n_lab, aes(x = lab_x, y = y, label = lab, colour = grp),
+                inherit.aes = FALSE, hjust = 0, vjust = 1,
+                size = lab_size, fontface = "bold", show.legend = FALSE) +
+      # sample size, bracketed
+      geom_text(data = n_lab, aes(x = lab_x + lab_gap, y = y, label = n_txt,
+                                  colour = grp),
+                inherit.aes = FALSE, hjust = 0, vjust = 1,
+                size = lab_size, fontface = "bold", show.legend = FALSE) +
+      facet_wrap(~ round, ncol = 2,
+                 labeller = labeller(round = function(z) paste("Round", z))) +
+      scale_x_continuous(breaks = seq(0, 24, 2), limits = c(0, 24),
+                         expand = c(0.012, 0)) +
+      scale_y_continuous(breaks = seq(0, y_max, 500), limits = c(0, y_max),
+                         expand = c(0.008, 0)) +
+      scale_colour_manual(values   = AGE_COL, name = legend_title, drop = FALSE) +
+      scale_fill_manual(values     = AGE_COL, name = legend_title, drop = FALSE) +
+      scale_linetype_manual(values = AGE_LTY, name = legend_title, drop = FALSE) +
+      labs(x = "Time of Day (hours)", y = "Mean daily activity") +
+      theme_bw(base_size = 9) +
+      theme(
+        panel.grid.major  = element_line(colour = "grey93", linewidth = 0.22),
+        panel.grid.minor  = element_blank(),
+        panel.border      = element_rect(colour = "grey45", linewidth = 0.35),
+        panel.spacing.x   = unit(9, "pt"),
+        panel.spacing.y   = unit(7, "pt"),
+        strip.background  = element_rect(fill = "grey93", colour = "grey45",
+                                         linewidth = 0.35),
+        strip.text        = element_text(size = 8.8, face = "bold", colour = "grey15",
+                                         margin = margin(t = 3.2, b = 3.2)),
+        axis.title.x      = element_text(size = 9.2, margin = margin(t = 6)),
+        axis.title.y      = element_text(size = 9.2, margin = margin(r = 6)),
+        axis.text.x       = element_text(size = 7.2, colour = "grey25"),
+        axis.text.y       = element_text(size = 7.8, colour = "grey25"),
+        axis.ticks        = element_line(colour = "grey45", linewidth = 0.3),
+        legend.position   = "bottom",
+        legend.title      = element_text(size = 9, margin = margin(r = 8)),
+        legend.text       = element_text(size = 8.4, margin = margin(r = 10, l = 3)),
+        legend.key        = element_blank(),
+        legend.key.width  = unit(20, "pt"),
+        legend.key.height = unit(9, "pt"),
+        legend.margin     = margin(t = 0, b = 0),
+        legend.box.margin = margin(t = -2),
+        plot.margin       = margin(5, 7, 3, 5)
+      ) +
+      guides(colour = lg_main, fill = lg_plain, linetype = lg_plain)
+  }
+
+  # Build and export -- TIFF only
+
+  age_plot_all <- make_age_plot(res_all)
+  age_plot_cc  <- make_age_plot(res_cc)
+
+  combined <- (age_plot_all / age_plot_cc) +
+    plot_layout(guides = "collect") +
+    plot_annotation(tag_levels = "A") &
+    theme(legend.position = "bottom",
+          plot.tag = element_text(face = "bold", size = 16))
+
+  combined
+})
+
+figure_3
+```
+
+## Figure 4: Significant and all eigenfunctions
+
+```{r figure-4, message=FALSE, warning=FALSE, fig.width=10, fig.height=13}
+figure_4 <- local({
+  phi   <- profit_result$phi
+  P_METHOD <- 1L  # 1: NLME/RLRsim; 2: direct optimization
+  npc <- profit_result$K
+  pval <- as.numeric(profit_result$pValue[P_METHOD, ])
+  stopifnot(length(pval) == npc, ncol(phi) >= npc)
+  phi <- phi[, seq_len(npc), drop = FALSE]
+  s <- seq_len(nrow(phi))
+  alpha <- 0.05
+  sig_idx <- which(pval <= alpha / npc)
+  stopifnot(length(sig_idx) > 0)
+
+  pc_colors <- colorRampPalette(c("#1f78b4", "#e31a1c", "#33a02c"))(max(3, length(sig_idx)))
+  pc_colors[1:2] <- c("#1f78b4", "#e31a1c")
+
+  # 2. Per-PC sign so orientation matches the reference figure
+  #   PC1 should dip DOWN midday; PC2 should peak UP in the morning.
+  #   Eigenfunction signs are arbitrary, so set each explicitly.
+  #   If a curve comes out inverted, flip that entry: c(1,-1) <-> c(-1,1) etc.
+  sign_all <- rep(1, npc)
+  if (npc >= 2) sign_all[2] <- -1
+  sign_vec <- sign_all[sig_idx]
+  phi_signed <- sweep(phi[, sig_idx, drop = FALSE], 2, sign_vec, `*`)
+
+  # 3. Long-format data
+  plot_df <- as.data.frame(phi_signed) %>%
+    setNames(paste0("PC", sig_idx)) %>%
+    mutate(hours = s / 60) %>%
+    pivot_longer(-hours, names_to = "PC", values_to = "value") %>%
+    mutate(PC = factor(PC, levels = paste0("PC", sig_idx)))
+
+  # 4. Legend labels with % variance (if eigenvalues available)
+  pve <- if (!is.null(profit_result$eigen_val))
+    round(100 * profit_result$eigen_val / sum(profit_result$eigen_val), 1) else NULL
+  leg_labels <- if (!is.null(pve))
+    paste0("PC", sig_idx, " (", pve[sig_idx], "%)") else paste0("PC", sig_idx)
+
+  # 5. Plot
+  sig_eigen <- ggplot(plot_df, aes(hours, value, colour = PC)) +
+    geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.4) +
+    geom_line(linewidth = 1.1) +
+    scale_colour_manual(values = pc_colors[seq_along(sig_idx)],
+                        labels = leg_labels, name = "Principal Component") +
+    scale_x_continuous(breaks = seq(2, 24, 2), expand = expansion(mult = 0.01)) +
+    labs(
+      title = "Significant PCs of Physical Activity (Bonferroni-adjusted)",
+      x = "Time of Day (hours)",
+      y = expression(phi[k](s))
+    ) +
+    theme_bw(base_size = 13, base_family = "serif") +
+    theme(
+      plot.title           = element_text(face = "bold", hjust = 0.5, size = 14),
+      legend.position      = c(0.99, 0.99),
+      legend.justification = c(1, 1),
+      legend.background    = element_rect(fill = alpha("white", 0.8), colour = "grey80"),
+      legend.title         = element_text(size = 11),
+      panel.grid.minor     = element_blank(),
+      panel.grid.major     = element_line(colour = "grey90")
+    )
+
+  phi <- profit_result$phi[, seq_len(npc), drop = FALSE]
+  s   <- seq_len(nrow(phi))
+  time_hours <- s / 60
+  pct <- 100 * profit_result$eigen_val[seq_len(npc)] / sum(profit_result$eigen_val)
+  K   <- ncol(phi)
+
+  # Keep component signs consistent with panel A.
+  phi_o <- sweep(phi, 2, sign_all, `*`)
+
+  pc_labels <- paste0("PC", 1:K, "\n(", round(pct, 1), "% variance)")
+
+  phi_df <- as.data.frame(phi_o) %>%
+    setNames(paste0("PC", 1:K)) %>%
+    mutate(Time = time_hours) %>%
+    pivot_longer(-Time, names_to = "PC", values_to = "Eigenfunction") %>%
+    mutate(PC_num = readr::parse_number(PC),
+           PC_lab = factor(pc_labels[PC_num], levels = pc_labels))
+
+  cols <- colorRampPalette(brewer.pal(8, "Dark2"))(K)
+
+  all_eig_plot <- ggplot(phi_df, aes(Time, Eigenfunction, colour = factor(PC_num))) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60", linewidth = 0.4) +
+    geom_line(linewidth = 1) +
+    facet_wrap(~ PC_lab, scales = "free_y", ncol = 4) +
+    scale_colour_manual(values = cols) +
+    scale_x_continuous(breaks = seq(0, 24, 6)) +
+    labs(x = "Time of Day (Hours)", y = expression(phi[k](s)),
+         title = "Functional Principal Component Eigenfunctions") +
+    theme_bw(base_size = 14) +
+    theme(legend.position = "none",
+          strip.background = element_rect(fill = "grey85", colour = "black"),
+          strip.text = element_text(face = "bold", size = 11),
+          plot.title = element_text(face = "bold", hjust = 0.5),
+          panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = "grey90"))
+
+  combined <- (sig_eigen / all_eig_plot) +
+    plot_annotation(tag_levels = "A") &
+    theme(plot.tag = element_text(face = "bold", size = 16))
+
+  combined
+})
+
+figure_4
+```
+
+## Figure 5: FPC correlations with mean activity
+
+```{r figure-5, message=FALSE, warning=FALSE, fig.width=10, fig.height=5.5}
+figure_5 <- local({
+  merged_clean <- figure_dat
+  func_cols <- profit_columns
+  mean_act<- rowMeans(as.matrix(merged_clean[, func_cols]), na.rm = TRUE)
+
+  # oriented projection scores (same construction as your models)
+  Phi    <- profit_result$phi[, seq_len(profit_result$K), drop = FALSE]
+  proj   <- as.matrix(merged_clean[, func_cols]) %*% Phi / length(func_cols)
+  K      <- profit_result$K
+
+  corr_df <- tibble(
+    FPC         = paste0("FPC", 1:K),
+    Correlation = sapply(1:K, function(k) cor(proj[, k], mean_act,
+                                              use = "complete.obs"))
+  )
+
+  corr_df <- corr_df %>%
+    mutate(FPC = factor(as.character(FPC), levels = paste0("FPC", 1:K)))  # FPC1 first
+
+  corr_plot <- ggplot(corr_df, aes(x = FPC, y = 1, fill = Correlation)) +
+    geom_tile(colour = "white", linewidth = 1.2) +
+    geom_text(
+      aes(label = sprintf("%.2f", Correlation)),
+      fontface = "bold",
+      size = 4.5,
+      colour = ifelse(abs(corr_df$Correlation) > 0.5, "white", "grey15")
+    ) +
+    scale_fill_gradient2(
+      low = "#2166AC",
+      mid = "grey95",
+      high = "#B2182B",
+      midpoint = 0,
+      limits = c(-1, 1),
+      name = "Pearson r",
+      breaks = seq(-1, 1, 0.5)
+    ) +
+    scale_x_discrete(position = "top") +
+    coord_equal() +
+    labs(
+      x = NULL,
+      y = NULL
+    ) +
+    theme_minimal(base_size = 14, base_family = "serif") +
+    theme(
+      axis.text.x       = element_text(face = "bold", size = 12),
+      axis.text.y       = element_blank(),
+      panel.grid        = element_blank(),
+      legend.position   = "right",
+      legend.key.height = unit(1.6, "lines"),
+      plot.margin       = margin(10, 10, 10, 10)
+    )
+
+  corr_plot
+})
+
+figure_5
+```
+
+## Figure 6: Paired differences between rounds
+
+Panel A compares consecutive rounds; panel B compares Rounds 12-14 with Round 11. The main figure displays the pointwise intervals, while the optional diagnostic export also displays simultaneous bands. Your original bootstrap settings (1,000 resamples, seed 123) are retained.
+
+```{r figure-6, message=FALSE, warning=FALSE, fig.width=10, fig.height=10}
+figure_6_results <- local({
+  merged_clean <- figure_dat
+  minute_cols <- profit_columns[order(parse_number(profit_columns))]
+
+  smooth_vec <- function(y, x, span = 0.08) {
+    ok <- is.finite(y)
+    if (sum(ok) < 20) return(y)
+    fit <- loess(y ~ x, data = data.frame(x = x[ok], y = y[ok]),
+                 span = span, control = loess.control(surface = "direct"))
+    as.numeric(predict(fit, newdata = data.frame(x = x)))
+  }
+
+  # 3) Paired difference matrix for two rounds
+  #    CONVENTION: later - earlier  (positive = higher in later round)
+  #    so pass (round_later, round_earlier)
+  make_diff_mat <- function(data, round_later, round_earlier, minute_cols) {
+    a <- data %>% filter(round == round_later)  %>% select(spid, all_of(minute_cols))
+    b <- data %>% filter(round == round_earlier) %>% select(spid, all_of(minute_cols))
+    common_ids <- intersect(a$spid, b$spid)
+    a <- a %>% filter(spid %in% common_ids) %>% arrange(spid)
+    b <- b %>% filter(spid %in% common_ids) %>% arrange(spid)
+    stopifnot(length(common_ids) >= 2, identical(a$spid, b$spid))
+    list(common_ids = common_ids,
+         diff_mat   = as.matrix(a[, minute_cols]) - as.matrix(b[, minute_cols]))
+  }
+
+  # 4) Bootstrap pointwise + simultaneous band
+  #    Also returns a joint p-value for "any minute differs from 0",
+  #    The FPCA option approximates simultaneous calibration across minutes.
+  boot_joint_band <- function(diff_mat, B = 1000, conf = 0.95,
+                              smooth = TRUE, span = 0.08,
+                              use_fpca = TRUE, fpca_pve = 0.95,
+                              Nsim = 5000, seed = 123) {
+    set.seed(seed)
+    n <- nrow(diff_mat); L <- ncol(diff_mat)
+    minute <- seq_len(L); alpha <- 1 - conf
+    
+    obs_mean <- colMeans(diff_mat, na.rm = TRUE)
+    
+    boot_mean <- matrix(NA_real_, nrow = B, ncol = L)
+    for (b in seq_len(B)) {
+      idx <- sample.int(n, size = n, replace = TRUE)
+      boot_mean[b, ] <- colMeans(diff_mat[idx, , drop = FALSE], na.rm = TRUE)
+    }
+    
+    if (smooth) {
+      obs_mean <- smooth_vec(obs_mean, minute, span = span)
+      for (b in seq_len(B)) boot_mean[b, ] <- smooth_vec(boot_mean[b, ], minute, span = span)
+    }
+    
+    # pointwise percentile band (UNCORRECTED — per-minute)
+    pt_lower <- apply(boot_mean, 2, quantile, probs = alpha / 2,     na.rm = TRUE)
+    pt_upper <- apply(boot_mean, 2, quantile, probs = 1 - alpha / 2, na.rm = TRUE)
+    
+    boot_se <- pmax(apply(boot_mean, 2, sd, na.rm = TRUE), .Machine$double.eps)
+    
+    # simultaneous band via supremum statistic (CORRECTED across minutes)
+    if (use_fpca) {
+      pca <- prcomp(boot_mean, center = TRUE, scale. = FALSE)
+      pve <- cumsum(pca$sdev^2) / sum(pca$sdev^2)
+      K   <- which(pve >= fpca_pve)[1]
+      mu  <- colMeans(boot_mean, na.rm = TRUE)
+      phi <- pca$rotation[, 1:K, drop = FALSE]
+      sds <- pca$sdev[1:K]
+      sup_stat <- replicate(Nsim, {
+        z <- rnorm(K, 0, sds)
+        curve <- as.numeric(mu + phi %*% z)
+        max(abs((curve - obs_mean) / boot_se), na.rm = TRUE)
+      })
+    } else {
+      z_boot <- abs(sweep(boot_mean, 2, obs_mean, "-")) /
+        matrix(boot_se, nrow = B, ncol = L, byrow = TRUE)
+      sup_stat <- apply(z_boot, 1, max, na.rm = TRUE)
+    }
+    crit <- as.numeric(quantile(sup_stat, probs = conf, na.rm = TRUE))
+    
+    sim_lower <- obs_mean - crit * boot_se
+    sim_upper <- obs_mean + crit * boot_se
+    
+    # joint p-value: observed sup-|z| vs its bootstrap null
+    obs_sup  <- max(abs(obs_mean / boot_se), na.rm = TRUE)
+    joint_p  <- mean(sup_stat >= obs_sup)
+    
+    list(
+      band = tibble(minute, mean_diff = obs_mean,
+                    pt_lower, pt_upper, sim_lower, sim_upper),
+      joint_p = joint_p
+    )
+  }
+
+  # Bootstrap matched participants for each comparison.
+  run_comparisons <- function(comparisons) {
+    fits <- pmap(comparisons, function(later, earlier, label) {
+      dm <- make_diff_mat(merged_clean, later, earlier, minute_cols)
+      res <- boot_joint_band(dm$diff_mat, B = 1000, smooth = TRUE, span = 0.08,
+                             use_fpca = TRUE, fpca_pve = 0.95, Nsim = 5000, seed = 123)
+      res$band <- res$band %>% mutate(comparison = label)
+      res$n_pairs <- length(dm$common_ids)
+      res
+    })
+    list(
+      band = map_dfr(fits, "band") %>%
+        mutate(comparison = factor(comparison, levels = comparisons$label)),
+      joint = comparisons %>%
+        mutate(n_pairs = map_int(fits, "n_pairs"),
+               joint_p = pmax(map_dbl(fits, "joint_p"), 1 / 5000),
+               p_holm = p.adjust(joint_p, method = "holm"),
+               reject = p_holm < 0.05)
+    )
+  }
+
+  consecutive <- tibble(
+    later = c(12, 13, 14), earlier = c(11, 12, 13),
+    label = c("Round 12 - Round 11", "Round 13 - Round 12", "Round 14 - Round 13")
+  )
+  baseline <- tibble(
+    later = c(12, 13, 14), earlier = c(11, 11, 11),
+    label = c("Round 12 - Round 11", "Round 13 - Round 11", "Round 14 - Round 11")
+  )
+  res_consecutive <- run_comparisons(consecutive)
+  res_baseline <- run_comparisons(baseline)
+
+  # Main manuscript: pointwise intervals only.
+  make_difference_plot <- function(res, title, include_simultaneous = FALSE) {
+    bands_long <- res$band %>%
+      pivot_longer(c(pt_lower, pt_upper, sim_lower, sim_upper),
+                   names_to = c("band", ".value"),
+                   names_pattern = "(pt|sim)_(lower|upper)") %>%
+      mutate(band = factor(recode(band, pt = "Pointwise CI", sim = "Simultaneous CI"),
+                           levels = c("Pointwise CI", "Simultaneous CI")))
+    if (!include_simultaneous) {
+      bands_long <- filter(bands_long, band == "Pointwise CI")
+    }
+    cols <- setNames(c("#3B528B", "#21908C", "#5DC863"), levels(res$band$comparison))
+
+    p <- ggplot(bands_long, aes(minute)) +
+      geom_ribbon(aes(ymin = lower, ymax = upper, fill = comparison),
+                  alpha = 0.25, colour = NA) +
+      geom_line(aes(y = mean_diff, colour = comparison), linewidth = 1.1) +
+      geom_hline(yintercept = 0, linetype = "dashed", colour = "black", linewidth = 0.7) +
+      scale_colour_manual(values = cols) +
+      scale_fill_manual(values = cols) +
+      scale_x_continuous(breaks = seq(0, 1440, 120), labels = seq(0, 24, 2),
+                         expand = expansion(mult = c(0.01, 0.01))) +
+      labs(title = title, x = "Time of Day (Hours)",
+           y = "Mean Difference in Physical Activity", colour = "Comparison", fill = "Comparison") +
+      theme_bw(base_size = 15, base_family = "serif") +
+      theme(
+        plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+        strip.background = element_rect(fill = "grey92", colour = "black"),
+        strip.text = element_text(face = "bold", size = 11),
+        axis.title = element_text(face = "bold", size = 12),
+        axis.text = element_text(size = 10, colour = "black"),
+        panel.grid.major = element_line(colour = "grey90"),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(colour = "black", linewidth = 0.8),
+        legend.position = "none"
+      )
+    if (include_simultaneous) p + facet_grid(band ~ comparison, scales = "free_y")
+    else p + facet_grid(. ~ comparison, scales = "free_y")
+  }
+
+  p1 <- make_difference_plot(res_consecutive, "Differences between consecutive rounds")
+  p2 <- make_difference_plot(res_baseline, "Differences from Round 11 baseline")
+  combined <- (p1 / p2) +
+    plot_annotation(tag_levels = "A") &
+    theme(plot.tag = element_text(face = "bold", size = 16))
+
+  list(plot = combined,
+       consecutive = res_consecutive, baseline = res_baseline,
+       diagnostic = (make_difference_plot(res_consecutive, "Consecutive rounds", TRUE) /
+                     make_difference_plot(res_baseline, "Versus Round 11", TRUE)) +
+         plot_annotation(tag_levels = "A"))
+})
+
+figure_6 <- figure_6_results$plot
+figure_6
+
+```
+
+The bootstrap comparison summaries remain available as `figure_6_results$consecutive$joint` and `figure_6_results$baseline$joint`. The source code adjusts joint p-values separately within the two sets of three comparisons; the main figure ribbons are pointwise intervals.
+
+
